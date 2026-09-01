@@ -1,0 +1,19 @@
+{
+  "name": "local-image-compressor",
+  "version": "0.1.0",
+  "description": "Electron image compressor with EchoWave web automation video compression",
+  "main": "main.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "sharp": "^0.34.3",
+    "playwright": "^1.62.1"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6"
+  }
+}
