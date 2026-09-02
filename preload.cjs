@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld('compressorAPI', {
   scanVideoFolder: () => ipcRenderer.invoke('select-video-folder'),
   scanVideoPaths: (paths) => ipcRenderer.invoke('scan-video-paths', paths),
   compressVideoBatch: (payload) => ipcRenderer.invoke('compress-video-batch', payload),
+  appendVideoTasks: (jobId, files) => ipcRenderer.invoke('append-video-tasks', jobId, files),
+  retryVideoTask: (jobId, taskId) => ipcRenderer.invoke('retry-video-task', jobId, taskId),
   cancelVideoCompress: (jobId) => ipcRenderer.invoke('cancel-video-compress', jobId),
   removeVideoTask: (jobId, taskId) => ipcRenderer.invoke('remove-video-task', jobId, taskId),
   pauseVideoCompress: (jobId) => ipcRenderer.invoke('pause-video-compress', jobId),

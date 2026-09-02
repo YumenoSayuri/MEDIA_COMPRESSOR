@@ -168,12 +168,11 @@ async function readUploadProgress(win, job, fallbackTotal) {
 async function readCompressionProgress(win, job) {
   return evaluate(win, `(() => {
     const text = document.body?.innerText || '';
-    const renderPage = /\u6b63\u5728\u6e32\u67d3\u89c6\u9891|\u6e32\u67d3\u89c6\u9891\u53ef\u80fd\u9700\u8981|rendering (?:your )?video/i.test(text);
-    if (!renderPage) return { percent: 0, candidates: [], text: text.slice(0, 1800), renderPage: false };
+    const renderPage = /\u6b63\u5728(?:\u6e32\u67d3|\u538b\u7f29|\u5904\u7406)(?:\u60a8\u7684)?\u89c6\u9891|\u6e32\u67d3\u89c6\u9891\u53ef\u80fd\u9700\u8981|(?:rendering|compressing|processing) (?:your )?video/i.test(text);
+    const failureMatch = text.match(/(?:\u538b\u7f29|\u6e32\u67d3|\u5904\u7406)[^\n]{0,80}?(?:\u5931\u8d25|\u51fa\u9519|\u9519\u8bef)|(?:compression|rendering|processing)[^\n]{0,80}?(?:failed|error)/i);
     const candidates = [];
     const add = (value, source) => { const n = Number(value); if (Number.isFinite(n) && n >= 0 && n <= 100) candidates.push({ percent: n, source }); };
-    // Only read EchoWave render bars; ignore media player volume/seek controls.
-    const renderBars = [...document.querySelectorAll('[role="progressbar"]')].filter((el) => /render|\u6e32\u67d3|tool-render-bar/i.test(String(el.className) + ' ' + (el.getAttribute('aria-label') || '')));
+    const renderBars = [...document.querySelectorAll('[role="progressbar"]')].filter((el) => /render|compress|process|\u538b\u7f29|\u6e32\u67d3|tool-render-bar/i.test(String(el.className) + ' ' + (el.getAttribute('aria-label') || '')));
     for (const el of renderBars) {
       add(el.getAttribute('aria-valuenow'), 'render-aria-valuenow');
       const child = el.querySelector('[style*="width"]');
@@ -183,33 +182,40 @@ async function readCompressionProgress(win, job) {
     }
     for (const el of document.querySelectorAll('*')) {
       const label = (el.innerText || '').trim();
-      if (!label || el.children.length > 3 || !/(\\u538b\\u7f29|compression|render|\\u5bfc\\u51fa|export|processing)/i.test(label)) continue;
+      if (!label || el.children.length > 3 || !/(\u538b\u7f29|compression|render|\u6e32\u67d3|\u5904\u7406|process|\u5bfc\u51fa|export)/i.test(label)) continue;
       const match = label.match(/(\\d{1,3}(?:\\.\\d+)?)\\s*%/);
       if (match) add(match[1], 'compression-text');
     }
-    const compressionText = text.match(/(?:\\u538b\\u7f29|compression|render|processing)[^%]{0,120}?(\\d{1,3}(?:\\.\\d+)?)\\s*%/i);
+    const compressionText = text.match(/(?:\u538b\u7f29|compression|render|\u6e32\u67d3|\u5904\u7406|processing)[^%]{0,160}?(\\d{1,3}(?:\\.\\d+)?)\\s*%/i);
     if (compressionText) add(compressionText[1], 'body-text');
-    return { percent: candidates.length ? Math.max(...candidates.map((item) => item.percent)) : 0, candidates, text: text.slice(0, 1800) };
+    return { percent: candidates.length ? Math.max(...candidates.map((item) => item.percent)) : 0, candidates, text: text.slice(0, 2200), renderPage, failure: failureMatch?.[0] || '' };
   })()`, job);
 }
 async function waitForCompressionComplete(win, job, onProgress) {
   const started = Date.now();
   let lastPercent = 0;
+  let lastIncreaseAt = started;
   while (Date.now() - started < 6 * 60 * 60 * 1000) {
     assertActive(win, job);
-    const info = await readCompressionProgress(win, job).catch(() => ({ percent: lastPercent, text: '' }));
-    const percent = Math.max(lastPercent, Math.min(100, Number(info.percent) || 0));
+    const info = await readCompressionProgress(win, job).catch(() => ({ percent: lastPercent, text: '', failure: '' }));
+    if (info.failure) throw new Error(`EchoWave \u7f51\u9875\u538b\u7f29\u5931\u8d25\uff1a${info.failure}`);
+    const rawPercent = Math.min(100, Number(info.percent) || 0);
+    if (rawPercent > lastPercent + 0.05) lastIncreaseAt = Date.now();
+    const percent = Math.max(lastPercent, rawPercent);
     lastPercent = percent;
     onProgress('rendering', 45 + percent * 0.52, `\u7f51\u9875\u538b\u7f29 ${Math.round(percent)}%`, { compressionPercent: percent });
     const complete = await evaluate(win, `(() => {
       const text = document.body?.innerText || '';
-      return /\\u538b\\u7f29\\u5b8c\\u6210|\\u5b8c\\u6210 \\ud83c\\udf89|compression complete|rendering complete|done/i.test(text)
-        && Boolean([...document.querySelectorAll('button')].find((button) => /\\u4e0b\\u8f7d|download/i.test(button.innerText || '')));
+      return /\u538b\u7f29\u5b8c\u6210|\u5b8c\u6210 \\ud83c\\udf89|compression complete|rendering complete|done/i.test(text)
+        && Boolean([...document.querySelectorAll('button,a,[role="button"]')].find((button) => /\u4e0b\u8f7d|download/i.test(button.innerText || button.textContent || '')));
     })()`, job).catch(() => false);
     if (complete) {
       onProgress('rendering', 97, '\u7f51\u9875\u538b\u7f29 100%', { compressionPercent: 100 });
       return;
     }
+    const stagnantFor = Date.now() - lastIncreaseAt;
+    if (lastPercent < 1 && Date.now() - started >= 10 * 60 * 1000) throw new Error('EchoWave \u7f51\u9875\u538b\u7f29\u8fde\u7eed 10 \u5206\u949f\u4ecd\u4e3a 0%\uff0c\u4efb\u52a1\u53ef\u80fd\u5df2\u5361\u6b7b\uff0c\u8bf7\u91cd\u8bd5');
+    if (lastPercent >= 1 && stagnantFor >= 20 * 60 * 1000) throw new Error(`EchoWave \u7f51\u9875\u538b\u7f29\u8fde\u7eed 20 \u5206\u949f\u505c\u5728 ${Math.round(lastPercent)}%\uff0c\u4efb\u52a1\u53ef\u80fd\u5df2\u5361\u6b7b\uff0c\u8bf7\u91cd\u8bd5`);
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error('\u7b49\u5f85 EchoWave \u538b\u7f29\u5b8c\u6210\u8d85\u65f6');

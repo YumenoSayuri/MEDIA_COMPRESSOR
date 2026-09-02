@@ -263,23 +263,73 @@ ipcMain.handle('resume-video-compress', async (_event, jobId) => {
   return true;
 });
 
-ipcMain.handle('compress-video-batch', async (event, payload) => {
-  const { files, options, jobId } = payload;
-  const job = { kind: 'video', canceled: false, paused: false, windows: new Set(), cancelHandlers: new Set(), downloadItems: new Set(), tasks: new Map() };
-  activeJobs.set(jobId, job);
-  const total = files.length;
-  const results = new Array(total);
-  const concurrency = Math.min(2, Math.max(1, Number(options.concurrency) || 2));
-  let nextIndex = 0;
-  let completed = 0;
+ipcMain.handle('append-video-tasks', async (_event, jobId, files) => {
+  const job = activeJobs.get(jobId);
+  if (!job || job.kind !== 'video' || job.canceled || !job.accepting || typeof job.appendFiles !== 'function') return { ok: false, added: [] };
+  return { ok: true, added: job.appendFiles(files || [], true) };
+});
 
-  files.forEach((file, index) => {
-    const taskId = file.taskId || `task-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    job.tasks.set(taskId, { taskId, file: { ...file, taskId }, index, started: false, removed: false, _canceled: false, stage: null, stageStartedAt: 0, stageDurations: {}, totalStartedAt: 0, maxUploadLoaded: 0, maxUploadPercent: 0, lastUploadDetail: '', lastUploadMeta: {}, windows: new Set(), cancelHandlers: new Set(), downloadItems: new Set(), parentJob: job, get canceled() { return this._canceled || job.canceled; }, set canceled(value) { this._canceled = value; } });
+ipcMain.handle('retry-video-task', async (_event, jobId, taskId) => {
+  const job = activeJobs.get(jobId);
+  const task = job?.tasks?.get(taskId);
+  if (!job || job.kind !== 'video' || job.canceled || !job.accepting || !task || task.removed || typeof job.appendFiles !== 'function') return { ok: false };
+  task.superseded = true;
+  if (task.result) task.result.superseded = true;
+  cancelVideoTask(task, false);
+  const replacementTaskId = `${taskId}-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const [added] = job.appendFiles([{ ...task.file, taskId: replacementTaskId }], true);
+  return added ? { ok: true, taskId: added } : { ok: false };
+});
+
+ipcMain.handle('compress-video-batch', async (event, payload) => {
+  const { files: initialFiles = [], options = {}, jobId } = payload;
+  const files = [];
+  const results = [];
+  const concurrency = Math.min(2, Math.max(1, Number(options.concurrency) || 2));
+  const job = {
+    kind: 'video', canceled: false, paused: false, accepting: true,
+    windows: new Set(), cancelHandlers: new Set(), downloadItems: new Set(), tasks: new Map(),
+    queueVersion: 0, queueWaiters: new Set(), nextIndex: 0, activeCount: 0, completed: 0,
+  };
+  activeJobs.set(jobId, job);
+
+  const wakeQueue = () => {
+    job.queueVersion += 1;
+    for (const resolve of job.queueWaiters) resolve(true);
+    job.queueWaiters.clear();
+  };
+  const waitForQueueChange = (version, timeout = 1000) => new Promise((resolve) => {
+    if (job.canceled || job.queueVersion !== version) { resolve(true); return; }
+    let settled = false;
+    const finish = (changed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      job.queueWaiters.delete(onWake);
+      resolve(changed);
+    };
+    const onWake = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeout);
+    job.queueWaiters.add(onWake);
   });
+  const createTask = (file, index) => {
+    const taskId = file.taskId || `task-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const normalizedFile = { ...file, taskId };
+    files.push(normalizedFile);
+    results.push(undefined);
+    job.tasks.set(taskId, {
+      taskId, file: normalizedFile, index, started: false, removed: false, superseded: false, _canceled: false,
+      stage: null, stageStartedAt: 0, stageDurations: {}, totalStartedAt: 0,
+      maxUploadLoaded: 0, maxUploadPercent: 0, lastUploadDetail: '', lastUploadMeta: {},
+      windows: new Set(), cancelHandlers: new Set(), downloadItems: new Set(), parentJob: job,
+      get canceled() { return this._canceled || job.canceled; }, set canceled(value) { this._canceled = value; },
+    });
+    return taskId;
+  };
 
   function emit(index, taskId, status, progress, detail = '', result, meta = {}) {
     const file = files[index];
+    if (!file) return;
     const trackedTask = job.tasks.get(taskId);
     const now = Date.now();
     if (trackedTask) {
@@ -309,19 +359,38 @@ ipcMain.handle('compress-video-batch', async (event, payload) => {
       meta = { ...meta, stageElapsed, totalElapsed, stageStartedAt: trackedTask.stageStartedAt, totalStartedAt: trackedTask.totalStartedAt };
     }
     if (event.sender.isDestroyed()) return;
-    event.sender.send('video-compress-progress', { index, taskId, current: completed, total, status, progress, detail, ...meta, uploadPercent: meta.uploadPercent, file: file.relativePath || path.basename(file.path), result });
+    event.sender.send('video-compress-progress', { index, taskId, current: job.completed, total: files.length, status, progress, detail, ...meta, uploadPercent: meta.uploadPercent, file: file.relativePath || path.basename(file.path), result });
   }
+
+  job.appendFiles = (newFiles, emitQueued = false) => {
+    if (!job.accepting || job.canceled) return [];
+    const added = [];
+    for (const file of newFiles || []) {
+      if (!file?.path) continue;
+      const index = files.length;
+      const taskId = createTask(file, index);
+      added.push(taskId);
+      if (emitQueued) emit(index, taskId, 'queued', 0, '\u5df2\u8ffd\u52a0\u5230\u961f\u5217');
+    }
+    if (added.length) wakeQueue();
+    return added;
+  };
+  job.appendFiles(initialFiles, false);
 
   async function processOne(index) {
     const file = files[index];
-    const taskId = file.taskId || [...job.tasks.values()].find((task) => task.index === index)?.taskId;
+    const taskId = file?.taskId;
     const task = job.tasks.get(taskId);
-    if (!task) return;
+    if (!file || !task) return;
     task.started = true;
-    task.totalStartedAt = Date.now();
+    task.totalStartedAt = task.totalStartedAt || Date.now();
     if (task.removed) {
-      task.result = { taskId, path: file.path, relativePath: file.relativePath, ok: false, removed: true, canceled: true, error: '\u5df2\u79fb\u9664' };
-      results[index] = task.result; completed += 1; emit(index, taskId, 'removed', 100, '\u5df2\u79fb\u9664', task.result); return;
+      task.result = { taskId, path: file.path, relativePath: file.relativePath, ok: false, removed: true, canceled: true, superseded: task.superseded, error: '\u5df2\u79fb\u9664' };
+      results[index] = task.result; job.completed += 1; emit(index, taskId, 'removed', 100, '\u5df2\u79fb\u9664', task.result); return;
+    }
+    if (task.canceled) {
+      task.result = { taskId, path: file.path, relativePath: file.relativePath, ok: false, canceled: true, superseded: task.superseded, error: '\u5df2\u505c\u6b62' };
+      results[index] = task.result; job.completed += 1; emit(index, taskId, 'canceled', 0, '\u5df2\u505c\u6b62', task.result); return;
     }
     emit(index, taskId, 'opening', 5, '');
     let result;
@@ -331,47 +400,72 @@ ipcMain.handle('compress-video-batch', async (event, payload) => {
         task.maxUploadLoaded = 0; task.maxUploadPercent = 0; task.lastUploadDetail = ''; task.lastUploadMeta = {};
         emit(index, taskId, 'retrying', 5, `\u6b63\u5728\u91cd\u8bd5\uff1a\u7b2c ${attempt + 1} \u6b21\uff0c\u5171 ${maxRetries + 1} \u6b21`, undefined, { retryAttempt: attempt, retryTotal: maxRetries });
       }
+      let cancelAttempt;
+      const canceledAttempt = new Promise((_, reject) => {
+        cancelAttempt = () => reject(new Error(task.removed ? '\u5df2\u79fb\u9664' : '\u5df2\u505c\u6b62'));
+        task.cancelHandlers.add(cancelAttempt);
+      });
+      const automationAttempt = runEchoWaveVideo({ file, options: { ...options, showBrowser: process.env.ECHOWAVE_SHOW_BROWSER === '1' }, job: task, onProgress: (status, progress, detail, meta) => emit(index, taskId, status, progress, detail, undefined, meta) });
       try {
-        result = await runEchoWaveVideo({ file: { ...file, taskId }, options: { ...options, showBrowser: process.env.ECHOWAVE_SHOW_BROWSER === '1' }, job: task, onProgress: (status, progress, detail, meta) => emit(index, taskId, status, progress, detail, undefined, meta) });
+        result = await Promise.race([automationAttempt, canceledAttempt]);
       } catch (error) {
         result = { taskId, path: file.path, relativePath: file.relativePath, ok: false, removed: task.removed, canceled: task.canceled, error: task.removed ? '\u5df2\u79fb\u9664' : task.canceled ? '\u5df2\u505c\u6b62' : error.message, detail: task.lastProgress?.detail, progress: task.lastProgress?.progress, uploadPercent: task.lastProgress?.uploadPercent };
+      } finally {
+        task.cancelHandlers.delete(cancelAttempt);
+        automationAttempt.catch(() => {});
       }
       const failureStage = result.failureStage || task.lastProgress?.status;
-      const retryableFailure = failureStage === 'opening' || failureStage === 'uploading' || failureStage === 'downloading';
+      const retryableFailure = failureStage === 'opening' || failureStage === 'uploading' || failureStage === 'rendering' || failureStage === 'downloading';
       if (result.ok || result.removed || result.canceled || !retryableFailure || attempt >= maxRetries) break;
     }
-    result = { taskId, ...result };
-    task.result = result; results[index] = result; completed += 1;
+    result = { taskId, ...result, superseded: Boolean(task.superseded || result?.superseded) };
+    task.result = result; results[index] = result; job.completed += 1;
     const status = result.removed ? 'removed' : result.canceled ? 'canceled' : result.ok ? 'completed' : 'error';
     const finalProgress = result.ok || result.removed ? 100 : (Number.isFinite(Number(result.progress)) ? Number(result.progress) : (task.lastProgress?.progress || 0));
     emit(index, taskId, status, finalProgress, result.ok ? '' : (result.detail || result.error || ''), result, { uploadPercent: result.uploadPercent, uploadLoaded: result.uploadLoaded, uploadTotal: result.uploadTotal, uploadSpeed: result.uploadSpeed, uploadEta: result.uploadEta });
   }
 
   async function waitIfPaused() {
-    while (job.paused && !job.canceled && [...job.tasks.values()].some((task) => !task.removed && !task.started)) await new Promise((resolve) => setTimeout(resolve, 200));
+    while (job.paused && !job.canceled) await new Promise((resolve) => setTimeout(resolve, 200));
   }
   async function worker() {
     while (!job.canceled) {
-      await waitIfPaused(); if (job.canceled) return;
-      const index = nextIndex++; if (index >= total) return;
-      await processOne(index);
+      await waitIfPaused();
+      if (job.canceled) return;
+      if (job.nextIndex < files.length) {
+        const index = job.nextIndex++;
+        job.activeCount += 1;
+        try { await processOne(index); }
+        finally { job.activeCount -= 1; wakeQueue(); }
+        continue;
+      }
+      const version = job.queueVersion;
+      const changed = await waitForQueueChange(version, 1200);
+      if (!changed && job.nextIndex >= files.length && job.activeCount === 0) return;
     }
   }
+
   try {
-    await Promise.all(Array.from({ length: Math.min(concurrency, total) }, worker));
-    for (let index = 0; index < total; index += 1) {
+    await Promise.all(Array.from({ length: concurrency }, worker));
+    job.accepting = false;
+    for (let index = 0; index < files.length; index += 1) {
       if (!results[index]) {
-        const file = files[index]; const task = [...job.tasks.values()].find((item) => item.index === index);
+        const file = files[index]; const task = job.tasks.get(file.taskId);
         results[index] = task?.removed
-          ? { taskId: task.taskId, path: file.path, relativePath: file.relativePath, ok: false, removed: true, canceled: true, error: '\u5df2\u79fb\u9664' }
+          ? { taskId: task.taskId, path: file.path, relativePath: file.relativePath, ok: false, removed: true, canceled: true, superseded: task.superseded, error: '\u5df2\u79fb\u9664' }
           : task?.started
-            ? { taskId: task?.taskId, path: file.path, relativePath: file.relativePath, ok: false, canceled: true, error: '\u5df2\u505c\u6b62', progress: task.lastProgress?.progress || 0 }
+            ? { taskId: task?.taskId, path: file.path, relativePath: file.relativePath, ok: false, canceled: true, superseded: task?.superseded, error: '\u5df2\u505c\u6b62', progress: task.lastProgress?.progress || 0 }
             : { taskId: task?.taskId, path: file.path, relativePath: file.relativePath, ok: false, pending: true, error: '' };
       }
     }
     return results;
-  } finally { activeJobs.delete(jobId); }
+  } finally {
+    job.accepting = false;
+    wakeQueue();
+    activeJobs.delete(jobId);
+  }
 });
+
 ipcMain.handle('cancel-compress', async (_event, jobId) => {
   const job = activeJobs.get(jobId);
   if (job) job.canceled = true;

@@ -341,7 +341,7 @@ const videoStatusText = {
   queued: '\u6392\u961f\u4e2d', retrying: '\u91cd\u8bd5\u4e2d', opening: '\u6253\u5f00 EchoWave', uploading: '\u4e0a\u4f20\u4e2d',
   configuring: '\u8bbe\u7f6e\u7f51\u9875\u9009\u9879', submitting: '\u63d0\u4ea4\u538b\u7f29', rendering: 'EchoWave \u538b\u7f29\u4e2d',
   downloading: '\u4e0b\u8f7d\u5e76\u91cd\u547d\u540d', completed: '\u5b8c\u6210', error: '\u5931\u8d25',
-  canceled: '\u5df2\u505c\u6b62', pending: '\u5f85\u5904\u7406', stopping: '\u6b63\u5728\u505c\u6b62', removed: '\u5df2\u79fb\u9664', waiting: '\u7b49\u5f85\u4e2d',
+  canceled: '\u5df2\u505c\u6b62', retrying: '\u91cd\u8bd5\u4e2d', pending: '\u5f85\u5904\u7406', stopping: '\u6b63\u5728\u505c\u6b62', removed: '\u5df2\u79fb\u9664', waiting: '\u7b49\u5f85\u4e2d',
 };
 function videoFileName(file) { return String(file?.path || '').split(/[/\\]/).pop(); }
 function videoFormatBytes(bytes) { return formatBytes(Number(bytes) || 0); }
@@ -422,7 +422,11 @@ function renderVideoFiles() {
       ? `${videoFormatBytes(result.finalBytes)} \u00b7 ${videoFileName({ path: result.outputPath || '' })}`
       : (result.detail || result.error || '');
     const terminal = ['completed', 'error', 'canceled', 'removed'].includes(status);
-    const webPercent = status === 'rendering' && Number.isFinite(Number(result.compressionPercent)) ? `\u7f51\u9875\u538b\u7f29 ${Math.round(Number(result.compressionPercent))}%` : '';
+    const renderWaitSeconds = status === 'rendering' && Number(result.stageStartedAt) ? Math.max(0, (Date.now() - Number(result.stageStartedAt)) / 1000) : 0;
+    const compressionPercent = Number(result.compressionPercent);
+    const webPercent = status === 'rendering' && Number.isFinite(compressionPercent)
+      ? (compressionPercent < 1 && renderWaitSeconds >= 300 ? '\u7f51\u9875\u538b\u7f29 0%\uff08\u7591\u4f3c\u5361\u4f4f\uff0c10\u5206\u949f\u540e\u81ea\u52a8\u7ed3\u675f\uff09' : `\u7f51\u9875\u538b\u7f29 ${Math.round(compressionPercent)}%`)
+      : '';
     const progressDetail = terminal || status === 'rendering' ? '' : result.detail;
     const currentTotalElapsed = Number.isFinite(Number(result.totalElapsed)) ? Number(result.totalElapsed) : (Number(result.totalStartedAt) ? Math.max(0, (Date.now() - Number(result.totalStartedAt)) / 1000) : null);
     const currentStageElapsed = Number.isFinite(Number(result.stageElapsed)) ? Number(result.stageElapsed) : (Number(result.stageStartedAt) ? Math.max(0, (Date.now() - Number(result.stageStartedAt)) / 1000) : null);
@@ -443,7 +447,7 @@ function renderVideoFiles() {
         ${progressDetail ? `<small title="${escapeHtml(progressDetail)}">${escapeHtml(progressDetail)}</small>` : ''}
       </div>
       <div class="video-result" title="${escapeHtml(resultLabel)}">${escapeHtml(resultLabel)}</div>
-      <div class="video-row-actions">${status === 'error' ? `<button class="video-retry" data-video-retry="${escapeHtml(file.taskId)}" ${videoState.busy ? 'disabled' : ''} title="\u91cd\u8bd5\u6b64\u6587\u4ef6">\u91cd\u8bd5</button>` : ''}<button class="video-remove" data-video-remove="${escapeHtml(file.taskId)}" title="\u968f\u65f6\u79fb\u9664\u6b64\u4efb\u52a1">\u79fb\u9664</button></div>
+      <div class="video-row-actions">${status !== 'completed' && status !== 'removed' ? `<button class="video-retry" data-video-retry="${escapeHtml(file.taskId)}" ${['stopping', 'retrying'].includes(status) ? 'disabled' : ''} title="\u91cd\u65b0\u63d0\u4ea4\u6b64\u6587\u4ef6">\u91cd\u8bd5</button>` : ''}<button class="video-remove" data-video-remove="${escapeHtml(file.taskId)}" title="\u968f\u65f6\u79fb\u9664\u6b64\u4efb\u52a1">\u79fb\u9664</button></div>
     </div>`;
   }).join('');
 
@@ -467,15 +471,31 @@ function renderVideoFiles() {
   videoEls.files.querySelectorAll('[data-video-retry]').forEach((button) => button.addEventListener('click', () => retryVideoTask(button.dataset.videoRetry)));
 }
 async function retryVideoTask(taskId) {
-  if (videoState.busy) return;
   const file = videoState.files.find((item) => item.taskId === taskId);
-  if (!file) return;
+  if (!file || file.result?.status === 'completed') return;
+  if (videoState.busy && videoState.jobId) {
+    const oldTaskId = file.taskId;
+    file.result = { ...file.result, status: 'retrying', progress: 5, detail: '\u6b63\u5728\u7ed3\u675f\u539f\u4efb\u52a1\u5e76\u91cd\u65b0\u6392\u961f' };
+    renderVideoFiles();
+    try {
+      const response = await window.compressorAPI.retryVideoTask(videoState.jobId, oldTaskId);
+      if (!response?.ok || !response.taskId) throw new Error('\u5f53\u524d\u6279\u6b21\u5df2\u7ed3\u675f\uff0c\u65e0\u6cd5\u8ffd\u52a0\u91cd\u8bd5');
+      file.taskId = response.taskId;
+      file.result = { status: 'queued', progress: 0, detail: '\u5df2\u91cd\u65b0\u52a0\u5165\u5f53\u524d\u961f\u5217' };
+      videoEls.status.textContent = `\u5df2\u91cd\u65b0\u6392\u961f\uff1a${videoFileName(file)}`;
+    } catch (error) {
+      file.result = { ...file.result, status: 'error', detail: error.message, error: error.message };
+      videoEls.status.textContent = `\u91cd\u8bd5\u5931\u8d25\uff1a${error.message}`;
+    }
+    renderVideoFiles();
+    return;
+  }
   videoState.busy = true;
   videoState.stopRequested = false;
   videoState.jobId = `video-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   file.result = { status: 'queued', progress: 0, detail: '' };
   videoEls.error.hidden = true;
-  videoEls.status.textContent = '正在重试该文件…';
+  videoEls.status.textContent = '\u6b63\u5728\u91cd\u8bd5\u8be5\u6587\u4ef6\u2026';
   renderVideoFiles();
   try {
     const results = await window.compressorAPI.compressVideoBatch({
@@ -483,27 +503,46 @@ async function retryVideoTask(taskId) {
       files: [{ taskId: file.taskId, path: file.path, relativePath: file.relativePath, root: file.root, size: file.size }],
       options: { mode: videoState.mode, preset: videoState.preset, crf: Number(videoEls.crf.value), resolution: videoEls.resolution.value, framerate: videoEls.framerate.value, videoCodec: videoEls.videoCodec.value, audioCodec: videoEls.audioCodec.value, outputFolder: videoState.outputFolder, saveMode: videoState.saveMode, concurrency: 1, autoRetry: videoEls.autoRetry.checked, retryCount: Number(videoEls.retryCount.value) || 0 },
     });
-    const result = results[0];
-    if (result) file.result = { ...file.result, ...result, status: result.ok ? 'completed' : result.removed ? 'removed' : result.canceled ? 'canceled' : 'error', progress: result.ok || result.removed || result.canceled ? 100 : (Number(result.progress) || 0), detail: result.ok ? '' : (result.detail || result.error || '') };
-    videoEls.status.textContent = result?.ok ? '重试成功' : '重试失败';
+    const result = results.find((item) => item.taskId === file.taskId && !item.superseded) || results[0];
+    if (result) file.result = { ...file.result, ...result, status: result.ok ? 'completed' : result.removed ? 'removed' : result.pending ? 'pending' : result.canceled ? 'canceled' : 'error', progress: result.ok || result.removed ? 100 : (Number(result.progress) || 0), detail: result.ok ? '' : (result.detail || result.error || '') };
+    videoEls.status.textContent = result?.ok ? '\u91cd\u8bd5\u6210\u529f' : '\u91cd\u8bd5\u5931\u8d25';
   } catch (error) {
     file.result = { ...file.result, status: 'error', detail: error.message, error: error.message };
-    videoEls.status.textContent = '重试失败';
+    videoEls.status.textContent = '\u91cd\u8bd5\u5931\u8d25';
   } finally {
     videoState.busy = false; videoState.jobId = null; renderVideoFiles();
   }
 }
-function addVideoFiles(files) {
+async function addVideoFiles(files) {
   const existing = new Set(videoState.files.map((file) => String(file.path).toLowerCase()));
+  const addedFiles = [];
   for (const file of files || []) {
     if (!file?.path || existing.has(String(file.path).toLowerCase())) continue;
     existing.add(String(file.path).toLowerCase());
-    videoState.files.push({ ...file, taskId: `task-${Date.now()}-${Math.random().toString(36).slice(2)}` });
+    const added = { ...file, taskId: `task-${Date.now()}-${Math.random().toString(36).slice(2)}` };
+    if (videoState.busy) added.result = { status: 'queued', progress: 0, detail: '\u6b63\u5728\u8ffd\u52a0\u5230\u961f\u5217' };
+    videoState.files.push(added);
+    addedFiles.push(added);
   }
   renderVideoFiles();
-  videoEls.status.textContent = `\u5df2\u6dfb\u52a0 ${videoState.files.length} \u4e2a\u89c6\u9891 \u00b7 \u6700\u591a\u5e76\u53d1 2 \u4e2a EchoWave \u9875\u9762`;
+  if (!addedFiles.length) return [];
+  if (videoState.busy && videoState.jobId) {
+    try {
+      const payload = addedFiles.map(({ taskId, path, relativePath, root, size }) => ({ taskId, path, relativePath, root, size }));
+      const response = await window.compressorAPI.appendVideoTasks(videoState.jobId, payload);
+      if (!response?.ok) throw new Error('\u5f53\u524d\u6279\u6b21\u5df2\u7ed3\u675f');
+      const accepted = new Set(response.added || []);
+      for (const file of addedFiles) if (!accepted.has(file.taskId)) file.result = { status: 'pending', progress: 0, detail: '\u672a\u52a0\u5165\u5f53\u524d\u6279\u6b21\uff0c\u4e0b\u6b21\u5f00\u59cb\u65f6\u5904\u7406' };
+      videoEls.status.textContent = `\u8fd0\u884c\u4e2d\u5df2\u8ffd\u52a0 ${accepted.size} \u4e2a\u89c6\u9891 \u00b7 \u961f\u5217\u5171 ${videoState.files.length} \u4e2a`;
+    } catch (error) {
+      for (const file of addedFiles) file.result = { status: 'pending', progress: 0, detail: '\u672a\u52a0\u5165\u5f53\u524d\u6279\u6b21\uff0c\u4e0b\u6b21\u5f00\u59cb\u65f6\u5904\u7406' };
+      videoEls.status.textContent = `\u5df2\u6dfb\u52a0 ${addedFiles.length} \u4e2a\u89c6\u9891\uff0c\u4f46\u5f53\u524d\u6279\u6b21\u5df2\u7ed3\u675f`;
+    }
+  } else videoEls.status.textContent = `\u5df2\u6dfb\u52a0 ${videoState.files.length} \u4e2a\u89c6\u9891 \u00b7 \u6700\u591a\u5e76\u53d1 2 \u4e2a EchoWave \u9875\u9762`;
+  renderVideoFiles();
+  return addedFiles;
 }
-async function addDroppedVideoPaths(paths) { addVideoFiles(await window.compressorAPI.scanVideoPaths(paths)); }
+async function addDroppedVideoPaths(paths) { return addVideoFiles(await window.compressorAPI.scanVideoPaths(paths)); }
 function selectVideoPage(pageId) {
   document.querySelectorAll('.mode-tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.page === pageId));
   $('imagePage').hidden = pageId !== 'imagePage';
@@ -511,15 +550,13 @@ function selectVideoPage(pageId) {
 }
 document.querySelectorAll('.mode-tab').forEach((tab) => tab.addEventListener('click', () => selectVideoPage(tab.dataset.page)));
 $('chooseVideoFiles').addEventListener('click', async () => {
-  if (videoState.busy) return;
-  try { addVideoFiles(await window.compressorAPI.selectVideoFiles()); }
+  try { await addVideoFiles(await window.compressorAPI.selectVideoFiles()); }
   catch (error) { videoEls.status.textContent = `\u6dfb\u52a0\u5931\u8d25\uff1a${error.message}`; }
 });
 $('chooseVideoFolder').addEventListener('click', async () => {
-  if (videoState.busy) return;
   try {
     const result = await window.compressorAPI.scanVideoFolder();
-    if (!result?.canceled) addVideoFiles(result.files);
+    if (!result?.canceled) await addVideoFiles(result.files);
   } catch (error) { videoEls.status.textContent = `\u626b\u63cf\u5931\u8d25\uff1a${error.message}`; }
 });
 $('clearVideoFiles').addEventListener('click', async () => {
@@ -539,11 +576,10 @@ videoEls.picker.addEventListener('change', async () => {
   } catch (error) { videoEls.status.textContent = `\u6dfb\u52a0\u5931\u8d25\uff1a${error.message}`; }
   videoEls.picker.value = '';
 });
-videoEls.dropzone.addEventListener('click', () => { if (!videoState.busy) videoEls.picker.click(); });
+videoEls.dropzone.addEventListener('click', () => videoEls.picker.click());
 for (const eventName of ['dragenter', 'dragover']) videoEls.dropzone.addEventListener(eventName, (event) => { event.preventDefault(); videoEls.dropzone.classList.add('drag'); });
 for (const eventName of ['dragleave', 'drop']) videoEls.dropzone.addEventListener(eventName, (event) => { event.preventDefault(); videoEls.dropzone.classList.remove('drag'); });
 videoEls.dropzone.addEventListener('drop', (event) => {
-  if (videoState.busy) return;
   const paths = [...event.dataTransfer.files].map((file) => window.compressorAPI.getPathForFile(file)).filter(Boolean);
   addDroppedVideoPaths(paths).catch((error) => { videoEls.status.textContent = `\u6dfb\u52a0\u5931\u8d25\uff1a${error.message}`; });
 });
@@ -669,12 +705,13 @@ $('startVideoCompress').addEventListener('click', async () => {
           : { ...file.result, ...result, status: resultStatus, progress: result.ok || result.removed ? 100 : failedProgress, detail: result.ok ? '' : (result.detail || file.result?.detail || result.error || ''), stageElapsed: result.stageElapsed ?? file.result?.stageElapsed, totalElapsed: result.totalElapsed ?? file.result?.totalElapsed, compressionPercent: result.compressionPercent ?? file.result?.compressionPercent };
       }
     });
-    const ok = results.filter((result) => result.ok).length;
-    const pending = results.filter((result) => result.pending).length;
-    const canceled = results.filter((result) => result.canceled && !result.removed).length;
+    const visibleResults = results.filter((result) => !result.superseded);
+    const ok = visibleResults.filter((result) => result.ok).length;
+    const pending = visibleResults.filter((result) => result.pending).length;
+    const canceled = visibleResults.filter((result) => result.canceled && !result.removed).length;
     videoEls.status.textContent = videoState.stopRequested
       ? `\u5df2\u505c\u6b62 \u00b7 \u672c\u6b21\u5b8c\u6210 ${ok} \u4e2a \u00b7 \u505c\u6b62 ${canceled} \u4e2a \u00b7 \u672a\u5f00\u59cb ${pending} \u4e2a`
-      : `\u5b8c\u6210 \u00b7 ${ok}/${results.length} \u4e2a\u89c6\u9891 \u00b7 \u7ed3\u679c\u5df2\u6309\u4fdd\u5b58\u65b9\u5f0f\u5904\u7406`;
+      : `\u5b8c\u6210 \u00b7 ${ok}/${visibleResults.length} \u4e2a\u89c6\u9891 \u00b7 \u7ed3\u679c\u5df2\u6309\u4fdd\u5b58\u65b9\u5f0f\u5904\u7406`;
     renderVideoFiles();
   } catch (error) {
     videoEls.error.textContent = `\u6279\u91cf\u4efb\u52a1\u5931\u8d25\uff1a${error.message}`;
