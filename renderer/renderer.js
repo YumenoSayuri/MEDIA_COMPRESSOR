@@ -343,6 +343,12 @@ const videoStatusText = {
   downloading: '\u4e0b\u8f7d\u5e76\u91cd\u547d\u540d', completed: '\u5b8c\u6210', error: '\u5931\u8d25',
   canceled: '\u5df2\u505c\u6b62', retrying: '\u91cd\u8bd5\u4e2d', pending: '\u5f85\u5904\u7406', stopping: '\u6b63\u5728\u505c\u6b62', removed: '\u5df2\u79fb\u9664', waiting: '\u7b49\u5f85\u4e2d',
 };
+const videoStageOrder = { queued: 0, retrying: 0, opening: 1, uploading: 2, configuring: 3, submitting: 4, rendering: 5, downloading: 6, completed: 7 };
+function isStaleVideoEvent(current, next) {
+  if (!current || current === 'retrying' || ['error', 'canceled', 'removed', 'completed'].includes(next)) return false;
+  if (next === 'retrying' || ['error', 'canceled', 'removed', 'completed'].includes(current)) return false;
+  return (videoStageOrder[next] ?? 0) < (videoStageOrder[current] ?? 0);
+}
 function videoFileName(file) { return String(file?.path || '').split(/[/\\]/).pop(); }
 function videoFormatBytes(bytes) { return formatBytes(Number(bytes) || 0); }
 function videoFormatDuration(seconds) {
@@ -423,7 +429,7 @@ function renderVideoFiles() {
       : (result.detail || result.error || '');
     const terminal = ['completed', 'error', 'canceled', 'removed'].includes(status);
     const renderWaitSeconds = status === 'rendering' && Number(result.stageStartedAt) ? Math.max(0, (Date.now() - Number(result.stageStartedAt)) / 1000) : 0;
-    const compressionPercent = Number(result.compressionPercent);
+    const compressionPercent = result.compressionPercent === null || result.compressionPercent === undefined ? Number.NaN : Number(result.compressionPercent);
     const webPercent = status === 'rendering' && Number.isFinite(compressionPercent)
       ? (compressionPercent < 1 && renderWaitSeconds >= 300 ? '\u7f51\u9875\u538b\u7f29 0%\uff08\u7591\u4f3c\u5361\u4f4f\uff0c10\u5206\u949f\u540e\u81ea\u52a8\u7ed3\u675f\uff09' : `\u7f51\u9875\u538b\u7f29 ${Math.round(compressionPercent)}%`)
       : '';
@@ -599,6 +605,7 @@ window.compressorAPI.onVideoProgress((event) => {
   const file = videoState.files.find((item) => item.taskId === event.taskId);
   if (!file) return;
   const previous = file.result || {};
+  if (isStaleVideoEvent(previous.status, event.status)) return;
   const previousDetail = previous.detail || '';
   const terminal = ['completed', 'error', 'canceled', 'removed'].includes(event.status);
   const incomingUploadPercent = Number(event.uploadPercent);

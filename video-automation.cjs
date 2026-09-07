@@ -7,6 +7,7 @@ const PRESET_LABELS = { light: '\u8f7b\u5ea6\u538b\u7f29', balanced: '\u5e73\u88
 const VIDEO_CODECS = new Set(['auto', 'h264', 'h265', 'av1', 'copy']);
 const AUDIO_CODECS = new Set(['auto', 'aac', 'ac3', 'mp3', 'copy']);
 const claimedDownloadItems = new WeakSet();
+const ECHOWAVE_PARTITION = 'persist:echowave-video-v2';
 
 function safeName(value, fallback = 'video') {
   const name = String(value || fallback).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim();
@@ -124,7 +125,7 @@ function formatUploadDetail(progress, fallbackTotal) {
   const loaded = Number(progress?.loaded) || 0;
   const total = Number(progress?.total) || Number(fallbackTotal) || 0;
   const speed = Number(progress?.localSpeed ?? progress?.speed) || 0;
-  const eta = Number.isFinite(Number(progress?.localEta))
+  const eta = progress?.localEta !== null && progress?.localEta !== undefined && Number.isFinite(Number(progress.localEta))
     ? Number(progress.localEta)
     : (total > loaded && speed > 0 ? (total - loaded) / speed : null);
   const parts = [`\u5df2\u4e0a\u4f20 ${humanBytes(loaded)}${total ? ` / ${humanBytes(total)}` : ''}`];
@@ -165,14 +166,56 @@ async function readUploadProgress(win, job, fallbackTotal) {
   const percent = total > 0 ? Math.min(100, loaded / total * 100) : Number.isFinite(progress.domPercent) ? progress.domPercent : 0;
   return { ...progress, loaded, total, percent, done: Boolean(progress.done || progress.domDone), failed: Boolean(progress.failed) };
 }
+async function readEchoWavePagePhase(win, job) {
+  return evaluate(win, `(() => {
+    const text = document.body?.innerText || '';
+    const visible = (el) => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    // The upload/settings page also contains the heading “压缩视频” and the
+    // submit button.  Do not use those generic strings as evidence that the
+    // remote render has started.  Only inspect visible status/progress copy.
+    const statusText = [...document.querySelectorAll('h1,h2,h3,h4,p,[role="status"],[role="alert"]')]
+      .filter(visible)
+      .map((el) => (el.innerText || el.textContent || '').trim())
+      .filter(Boolean)
+      .join('\\n');
+    const uploadActive = /\u5bfb\u627e\u6700\u5feb\u7684\u4e0a\u4f20\u670d\u52a1\u5668|\u6b63\u5728(?:\u4e0a\u4f20|\u5b8c\u6210\u60a8\u7684\u4e0a\u4f20)|finding (?:the )?fastest upload server|uploading|finalizing (?:your )?upload/i.test(statusText);
+    const downloadVisible = [...document.querySelectorAll('button,a,[role="button"]')].some((el) => /\u4e0b\u8f7d|download/i.test(el.innerText || el.textContent || '') && visible(el));
+    if (/\u538b\u7f29\u5b8c\u6210|\u5b8c\u6210 \ud83c\udf89|compression complete|rendering complete/i.test(statusText) && downloadVisible) return { phase: 'completed' };
+    const renderText = /\u6b63\u5728(?:\u6e32\u67d3|\u538b\u7f29|\u5904\u7406)(?:\u60a8\u7684)?\u89c6\u9891|\u6e32\u67d3\u89c6\u9891\u53ef\u80fd\u9700\u8981|\u538b\u7f29\u4e2d|(?:rendering|compressing|processing) (?:your )?video/i.test(statusText);
+    const renderBar = [...document.querySelectorAll('progress,[role="progressbar"],[aria-valuenow]')].some((el) => visible(el) && /render|compress|process|\u6e32\u67d3/i.test(String(el.className) + ' ' + String(el.id || '') + ' ' + String(el.getAttribute('aria-label') || '')));
+    if (renderText || renderBar) return { phase: 'rendering' };
+    if (uploadActive) return { phase: 'uploading' };
+    const submit = document.querySelector('button[type="submit"]');
+    if (submit && visible(submit) && !submit.disabled) return { phase: 'configuring' };
+    if (document.querySelector('#dropzone-file')) return { phase: 'uploading' };
+    return { phase: 'unknown' };
+  })()`, job);
+}
 async function readCompressionProgress(win, job) {
   return evaluate(win, `(() => {
     const text = document.body?.innerText || '';
-    const renderPage = /\u6b63\u5728(?:\u6e32\u67d3|\u538b\u7f29|\u5904\u7406)(?:\u60a8\u7684)?\u89c6\u9891|\u6e32\u67d3\u89c6\u9891\u53ef\u80fd\u9700\u8981|(?:rendering|compressing|processing) (?:your )?video/i.test(text);
-    const failureMatch = text.match(/(?:\u538b\u7f29|\u6e32\u67d3|\u5904\u7406)[^\n]{0,80}?(?:\u5931\u8d25|\u51fa\u9519|\u9519\u8bef)|(?:compression|rendering|processing)[^\n]{0,80}?(?:failed|error)/i);
+    const visible = (el) => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const statusText = [...document.querySelectorAll('h1,h2,h3,h4,p,[role="status"],[role="alert"]')]
+      .filter(visible)
+      .map((el) => (el.innerText || el.textContent || '').trim())
+      .filter(Boolean)
+      .join('\\n');
+    const uploadActive = /\u5bfb\u627e\u6700\u5feb\u7684\u4e0a\u4f20\u670d\u52a1\u5668|\u6b63\u5728(?:\u4e0a\u4f20|\u5b8c\u6210\u60a8\u7684\u4e0a\u4f20)|finding (?:the )?fastest upload server|uploading|finalizing (?:your )?upload/i.test(statusText);
+    const renderPage = /\u6b63\u5728(?:\u6e32\u67d3|\u538b\u7f29|\u5904\u7406)(?:\u60a8\u7684)?\u89c6\u9891|\u6e32\u67d3\u89c6\u9891\u53ef\u80fd\u9700\u8981|\u538b\u7f29\u4e2d|(?:rendering|compressing|processing) (?:your )?video/i.test(statusText);
+    const failureMatch = text.match(/(?:\u538b\u7f29|\u6e32\u67d3|\u5904\u7406)[^\\n]{0,80}?(?:\u5931\u8d25|\u51fa\u9519|\u9519\u8bef)|(?:compression|rendering|processing)[^\\n]{0,80}?(?:failed|error)/i);
     const candidates = [];
     const add = (value, source) => { const n = Number(value); if (Number.isFinite(n) && n >= 0 && n <= 100) candidates.push({ percent: n, source }); };
-    const renderBars = [...document.querySelectorAll('[role="progressbar"]')].filter((el) => /render|compress|process|\u538b\u7f29|\u6e32\u67d3|tool-render-bar/i.test(String(el.className) + ' ' + (el.getAttribute('aria-label') || '')));
+    const renderBars = [...document.querySelectorAll('progress,[role="progressbar"],[aria-valuenow]')].filter((el) => visible(el) && /render|compress|process|\u6e32\u67d3|tool-render-bar/i.test(String(el.className) + ' ' + String(el.id || '') + ' ' + (el.getAttribute('aria-label') || '')));
     for (const el of renderBars) {
       add(el.getAttribute('aria-valuenow'), 'render-aria-valuenow');
       const child = el.querySelector('[style*="width"]');
@@ -180,30 +223,70 @@ async function readCompressionProgress(win, job) {
       const width = !indeterminate && String(child?.style?.width || el.style?.width || '').match(/([\\d.]+)%/);
       if (width) add(width[1], 'render-style-width');
     }
-    for (const el of document.querySelectorAll('*')) {
-      const label = (el.innerText || '').trim();
-      if (!label || el.children.length > 3 || !/(\u538b\u7f29|compression|render|\u6e32\u67d3|\u5904\u7406|process|\u5bfc\u51fa|export)/i.test(label)) continue;
-      const match = label.match(/(\\d{1,3}(?:\\.\\d+)?)\\s*%/);
-      if (match) add(match[1], 'compression-text');
+    const renderActive = renderPage || renderBars.length > 0;
+    if (renderActive) for (const el of document.querySelectorAll('*')) {
+        const label = (el.innerText || '').trim();
+        if (!label || el.children.length > 3 || !/(\u538b\u7f29|compression|render|\u6e32\u67d3|\u5904\u7406|process|\u5bfc\u51fa|export)/i.test(label)) continue;
+        const match = label.match(/(\\d{1,3}(?:\\.\\d+)?)\\s*%/);
+        if (match) add(match[1], 'compression-text');
     }
-    const compressionText = text.match(/(?:\u538b\u7f29|compression|render|\u6e32\u67d3|\u5904\u7406|processing)[^%]{0,160}?(\\d{1,3}(?:\\.\\d+)?)\\s*%/i);
-    if (compressionText) add(compressionText[1], 'body-text');
-    return { percent: candidates.length ? Math.max(...candidates.map((item) => item.percent)) : 0, candidates, text: text.slice(0, 2200), renderPage, failure: failureMatch?.[0] || '' };
+    if (renderActive) {
+      const compressionText = text.match(/(?:\u538b\u7f29|compression|render|\u6e32\u67d3|\u5904\u7406|processing)[^%]{0,160}?(\\d{1,3}(?:\\.\\d+)?)\\s*%/i);
+      if (compressionText) add(compressionText[1], 'body-text');
+    }
+    const completePage = /\u538b\u7f29\u5b8c\u6210|\u5b8c\u6210 \ud83c\udf89|compression complete|rendering complete/i.test(statusText)
+      && [...document.querySelectorAll('button,a,[role="button"]')].some((el) => /\u4e0b\u8f7d|download/i.test(el.innerText || el.textContent || ''));
+    const submit = document.querySelector('button[type="submit"]');
+    const phase = completePage ? 'completed' : renderActive ? 'rendering' : uploadActive ? 'uploading' : submit && !submit.disabled ? 'configuring' : document.querySelector('#dropzone-file') ? 'uploading' : 'unknown';
+    return { percent: candidates.length ? Math.max(...candidates.map((item) => item.percent)) : null, candidates, text: text.slice(0, 2200), renderPage: renderActive, phase, failure: failureMatch?.[0] || '' };
   })()`, job);
 }
 async function waitForCompressionComplete(win, job, onProgress) {
   const started = Date.now();
+  let renderStartedAt = null;
   let lastPercent = 0;
   let lastIncreaseAt = started;
-  while (Date.now() - started < 6 * 60 * 60 * 1000) {
+  let consecutiveReadErrors = 0;
+  let lastReadError = '';
+  const submitTimeout = 3 * 60 * 1000;
+  const indeterminateTimeout = 30 * 60 * 1000;
+  const absoluteTimeout = 2 * 60 * 60 * 1000;
+  while (Date.now() - started < absoluteTimeout) {
     assertActive(win, job);
-    const info = await readCompressionProgress(win, job).catch(() => ({ percent: lastPercent, text: '', failure: '' }));
+    let info;
+    try {
+      info = await readCompressionProgress(win, job);
+      consecutiveReadErrors = 0;
+      lastReadError = '';
+    } catch (error) {
+      if (isCanceled(job)) throw error;
+      consecutiveReadErrors += 1;
+      lastReadError = error?.message || String(error);
+      if (consecutiveReadErrors >= 15) throw new Error(`连续无法读取 EchoWave 页面状态：${lastReadError}`);
+      info = { percent: null, phase: 'unknown', text: '', failure: '' };
+    }
     if (info.failure) throw new Error(`EchoWave \u7f51\u9875\u538b\u7f29\u5931\u8d25\uff1a${info.failure}`);
-    const rawPercent = Math.min(100, Number(info.percent) || 0);
+    if (info.phase === 'completed') {
+      onProgress('rendering', 97, '\u7f51\u9875\u538b\u7f29 100%', { compressionPercent: 100, compressionPercentSource: 'web-dom' });
+      return;
+    }
+    const hasWebPercent = Number.isFinite(info.percent);
+    if (info.phase !== 'rendering' && !hasWebPercent) {
+      if (Date.now() - started >= submitTimeout) {
+        const pageHint = String(info.text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+        throw new Error(`提交压缩后 3 分钟仍未进入 EchoWave 渲染页面${pageHint ? `：${pageHint}` : ''}`);
+      }
+      onProgress('submitting', 40, '\u7b49\u5f85 EchoWave \u8fdb\u5165\u7f51\u9875\u538b\u7f29\u9875\u9762');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      continue;
+    }
+    if (!renderStartedAt) { renderStartedAt = Date.now(); lastIncreaseAt = renderStartedAt; }
+    const rawPercent = hasWebPercent ? Math.min(100, Number(info.percent)) : lastPercent;
     if (rawPercent > lastPercent + 0.05) lastIncreaseAt = Date.now();
-    const percent = Math.max(lastPercent, rawPercent);
+    const percent = rawPercent;
     lastPercent = percent;
-    onProgress('rendering', 45 + percent * 0.52, `\u7f51\u9875\u538b\u7f29 ${Math.round(percent)}%`, { compressionPercent: percent });
+    const webDetail = hasWebPercent ? `\u7f51\u9875\u538b\u7f29 ${Math.round(percent)}%` : '\u7f51\u9875\u538b\u7f29\u4e2d';
+    onProgress('rendering', hasWebPercent ? 45 + percent * 0.52 : 45, webDetail, { compressionPercent: hasWebPercent ? percent : null, compressionPercentSource: hasWebPercent ? 'web-dom' : 'web-phase' });
     const complete = await evaluate(win, `(() => {
       const text = document.body?.innerText || '';
       return /\u538b\u7f29\u5b8c\u6210|\u5b8c\u6210 \\ud83c\\udf89|compression complete|rendering complete|done/i.test(text)
@@ -214,11 +297,12 @@ async function waitForCompressionComplete(win, job, onProgress) {
       return;
     }
     const stagnantFor = Date.now() - lastIncreaseAt;
-    if (lastPercent < 1 && Date.now() - started >= 10 * 60 * 1000) throw new Error('EchoWave \u7f51\u9875\u538b\u7f29\u8fde\u7eed 10 \u5206\u949f\u4ecd\u4e3a 0%\uff0c\u4efb\u52a1\u53ef\u80fd\u5df2\u5361\u6b7b\uff0c\u8bf7\u91cd\u8bd5');
-    if (lastPercent >= 1 && stagnantFor >= 20 * 60 * 1000) throw new Error(`EchoWave \u7f51\u9875\u538b\u7f29\u8fde\u7eed 20 \u5206\u949f\u505c\u5728 ${Math.round(lastPercent)}%\uff0c\u4efb\u52a1\u53ef\u80fd\u5df2\u5361\u6b7b\uff0c\u8bf7\u91cd\u8bd5`);
+    if (hasWebPercent && lastPercent < 1 && Date.now() - renderStartedAt >= 10 * 60 * 1000) throw new Error('EchoWave \u7f51\u9875\u538b\u7f29\u8fde\u7eed 10 \u5206\u949f\u4ecd\u4e3a 0%\uff0c\u4efb\u52a1\u53ef\u80fd\u5df2\u5361\u6b7b\uff0c\u8bf7\u91cd\u8bd5');
+    if (hasWebPercent && lastPercent >= 1 && stagnantFor >= 20 * 60 * 1000) throw new Error(`EchoWave \u7f51\u9875\u538b\u7f29\u8fde\u7eed 20 \u5206\u949f\u505c\u5728 ${Math.round(lastPercent)}%\uff0c\u4efb\u52a1\u53ef\u80fd\u5df2\u5361\u6b7b\uff0c\u8bf7\u91cd\u8bd5`);
+    if (!hasWebPercent && Date.now() - renderStartedAt >= indeterminateTimeout) throw new Error('EchoWave 网页连续 30 分钟未提供压缩进度且尚未完成，已结束本次尝试并准备重试');
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
-  throw new Error('\u7b49\u5f85 EchoWave \u538b\u7f29\u5b8c\u6210\u8d85\u65f6');
+  throw new Error('等待 EchoWave 压缩完成超过 2 小时，已结束本次尝试并准备重试');
 }
 async function waitForUploadComplete(win, job, fileSize, onProgress) {
   const started = Date.now();
@@ -230,6 +314,10 @@ async function waitForUploadComplete(win, job, fileSize, onProgress) {
   while (Date.now() - started < 6 * 60 * 60 * 1000) {
     assertActive(win, job);
     const progress = await readUploadProgress(win, job, fileSize).catch(() => ({ loaded: maxLoaded, total: fileSize, percent: 0, done: false }));
+    const pagePhase = await readEchoWavePagePhase(win, job).catch(() => ({ phase: 'unknown' }));
+    if (pagePhase.phase === 'rendering' || pagePhase.phase === 'completed') {
+      return { transitioned: true, stage: pagePhase.phase, compressionPercent: 0 };
+    }
     const now = Date.now();
     const total = Number(progress.total) || fileSize;
     const currentLoaded = Math.max(0, Math.min(total, Number(progress.loaded) || 0));
@@ -247,13 +335,20 @@ async function waitForUploadComplete(win, job, fileSize, onProgress) {
     const pageReady = Boolean(progress.domDone || progress.finalizing);
     // EchoWave may round the displayed byte count or replace the completed upload row
     // with a smaller per-request value while finalizing. Keep completion evidence sticky.
-    if (currentPercent >= 98.5 || (Number.isFinite(domPercent) && domPercent >= 99.5) || pageReady) sawCompleteBytes = true;
+    if (currentPercent >= 99.5 || (Number.isFinite(domPercent) && domPercent >= 99.5) || pageReady) sawCompleteBytes = true;
     const localEta = total > loaded && lastSpeed > 0 ? (total - loaded) / lastSpeed : null;
     const tracked = { ...progress, loaded, total, percent, localSpeed: lastSpeed, localEta };
     job.uploadProgress = { ...tracked, detail: formatUploadDetail(tracked, fileSize) };
     if (progress.failed) throw new Error(progress.error || '\u4e0a\u4f20\u5931\u8d25');
     onProgress('uploading', 10 + percent * 0.25, job.uploadProgress.detail, { uploadPercent: percent, uploadLoaded: loaded, uploadTotal: total, uploadSpeed: lastSpeed, uploadEta: localEta });
-    const uploadReady = sawCompleteBytes && pageReady
+    // The submit button is already visible while the upload is still running.
+    // It is therefore not a valid upload-complete signal by itself.
+    // `loadend` is emitted for every XHR/chunk, not only for the whole file.
+    // Never treat that flag alone as completion; require the full-size upload
+    // (or EchoWave's explicit completion/finalizing text).
+    const uploadEvidence = Boolean(progress.domDone || progress.finalizing || sawCompleteBytes
+      || (progress.done && currentPercent >= 99.5));
+    const uploadReady = uploadEvidence && (pagePhase.phase === 'configuring' || pagePhase.phase === 'unknown')
       && await evaluate(win, `Boolean(document.querySelector('button[type="submit"]'))`, job).catch(() => false);
     if (uploadReady) {
       const completed = { ...tracked, loaded: fileSize, total: fileSize, percent: 100, localEta: 0 };
@@ -443,7 +538,7 @@ function waitForDownload(win, file, options, job, onProgress) {
         });
         return { action: 'deny' };
       }
-      return { action: 'allow', overrideBrowserWindowOptions: { show: Boolean(options.showBrowser), webPreferences: { partition: 'persist:echowave-video', contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } } };
+      return { action: 'allow', overrideBrowserWindowOptions: { show: Boolean(options.showBrowser), webPreferences: { partition: ECHOWAVE_PARTITION, contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } } };
     });
     win.webContents.on('did-create-window', onChildWindow);
     win.once('closed', onWindowClosed);
@@ -464,8 +559,8 @@ async function runEchoWaveVideo({ file, options, job, onProgress }) {
   const outputFolder = options.saveMode === 'fixed' ? options.outputFolder : path.dirname(file.path);
   if (!outputFolder) return { taskId: file.taskId, path: file.path, relativePath: file.relativePath, ok: false, error: '\u5c1a\u672a\u9009\u62e9\u56fa\u5b9a\u8f93\u51fa\u76ee\u5f55' };
   await fs.mkdir(outputFolder, { recursive: true });
-  const win = new BrowserWindow({ width: 1180, height: 820, show: Boolean(options.showBrowser), title: `EchoWave - ${path.basename(file.path)}`, webPreferences: { partition: 'persist:echowave-video', contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
-  win.webContents.setWindowOpenHandler(() => ({ action: 'allow', overrideBrowserWindowOptions: { show: Boolean(options.showBrowser), webPreferences: { partition: 'persist:echowave-video', contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } } }));
+  const win = new BrowserWindow({ width: 1180, height: 820, show: Boolean(options.showBrowser), title: `EchoWave - ${path.basename(file.path)}`, webPreferences: { partition: ECHOWAVE_PARTITION, contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+  win.webContents.setWindowOpenHandler(() => ({ action: 'allow', overrideBrowserWindowOptions: { show: Boolean(options.showBrowser), webPreferences: { partition: ECHOWAVE_PARTITION, contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } } }));
   job.windows.add(win); job.window = win;
   job.uploadProgress = null;
   let currentStage = 'opening';
@@ -477,10 +572,16 @@ async function runEchoWaveVideo({ file, options, job, onProgress }) {
   };
   try {
     report('opening', 5, ''); await win.loadURL('https://echowave.io/app/tools/compress'); await waitFor(win, `Boolean(document.querySelector('#dropzone-file'))`, job, 90000);
-    await installUploadProgressHook(win, job); await waitWhilePaused(job); report('uploading', 10, '\u51c6\u5907\u4e0a\u4f20'); await setFileInput(win, '#dropzone-file', file.path, job); await waitForUploadComplete(win, job, file.size, report);
-    await waitWhilePaused(job); report('configuring', 35, ''); await configure(win, options, job); await waitWhilePaused(job); report('submitting', 40, '');
-    const submitted = await evaluate(win, `(() => { const button=document.querySelector('button[type="submit"]'); if(!button)return false; button.click(); return true; })()`, job); if (!submitted) throw new Error('EchoWave \u9875\u9762\u672a\u627e\u5230\u5f00\u59cb\u538b\u7f29\u6309\u94ae');
-    report('rendering', 45, '\u7f51\u9875\u538b\u7f29 0%', { compressionPercent: 0 }); await waitForCompressionComplete(win, job, report);
+    await installUploadProgressHook(win, job); await waitWhilePaused(job); report('uploading', 10, '\u51c6\u5907\u4e0a\u4f20'); await setFileInput(win, '#dropzone-file', file.path, job);
+    const uploadState = await waitForUploadComplete(win, job, file.size, report);
+    if (!uploadState?.transitioned) {
+      await waitWhilePaused(job); report('configuring', 35, ''); await configure(win, options, job); await waitWhilePaused(job); report('submitting', 40, '');
+      const submitted = await evaluate(win, `(() => { const button=document.querySelector('button[type="submit"]'); if(!button)return false; button.click(); return true; })()`, job); if (!submitted) throw new Error('EchoWave \u9875\u9762\u672a\u627e\u5230\u5f00\u59cb\u538b\u7f29\u6309\u94ae');
+      report('submitting', 40, '\u7b49\u5f85 EchoWave \u8fdb\u5165\u7f51\u9875\u538b\u7f29\u9875\u9762', { compressionPercent: null });
+    } else {
+      report('rendering', 45, '\u7f51\u9875\u538b\u7f29\u4e2d', { compressionPercent: null });
+    }
+    await waitForCompressionComplete(win, job, report);
     await waitWhilePaused(job); report('downloading', 97, '\u51c6\u5907\u4e0b\u8f7d'); const downloaded = await waitForDownload(win, file, options, job, report); const stat = await fs.stat(downloaded.outputPath); report('completed', 100, '');
     return { taskId: file.taskId, path: file.path, relativePath: file.relativePath, ok: true, outputPath: downloaded.outputPath, outputName: downloaded.outputName, originalBytes: file.size, finalBytes: stat.size };
   } catch (error) {
@@ -497,3 +598,4 @@ async function runEchoWaveVideo({ file, options, job, onProgress }) {
   }
 }
 module.exports = { runEchoWaveVideo, outputPathFor, commitDownloadedFile };
+

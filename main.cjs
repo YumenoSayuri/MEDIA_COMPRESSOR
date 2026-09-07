@@ -5,10 +5,26 @@ const fsSync = require('node:fs');
 const sharp = require('sharp');
 const { runEchoWaveVideo } = require('./video-automation.cjs');
 
+// A detached test/diagnostic process can outlive the terminal that launched it.
+// In that case Node's console writes to a closed pipe and Electron otherwise
+// turns the resulting EPIPE into a modal main-process error dialog. Logging is
+// best-effort here; a closed stdout/stderr must not take down the app.
+for (const stream of [process.stdout, process.stderr]) {
+  stream?.on?.('error', (error) => {
+    if (error?.code === 'EPIPE') return;
+  });
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) app.quit();
 let mainWindow;
 const activeJobs = new Map();
+const VIDEO_STAGE_ORDER = { queued: 0, retrying: 0, opening: 1, uploading: 2, configuring: 3, submitting: 4, rendering: 5, downloading: 6, completed: 7 };
+function isStaleVideoProgress(current, next) {
+  if (!current || current === 'retrying' || ['error', 'canceled', 'removed', 'completed'].includes(next)) return false;
+  if (next === 'retrying' || ['error', 'canceled', 'removed', 'completed'].includes(current)) return false;
+  return (VIDEO_STAGE_ORDER[next] ?? 0) < (VIDEO_STAGE_ORDER[current] ?? 0);
+}
 
 const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json');
 
@@ -333,6 +349,7 @@ ipcMain.handle('compress-video-batch', async (event, payload) => {
     const trackedTask = job.tasks.get(taskId);
     const now = Date.now();
     if (trackedTask) {
+      if (isStaleVideoProgress(trackedTask.stage, status)) return;
       if (!trackedTask.totalStartedAt) trackedTask.totalStartedAt = now;
       if (status === 'uploading' && Number.isFinite(Number(meta.uploadPercent))) {
         const uploadPercent = Number(meta.uploadPercent);
@@ -415,7 +432,7 @@ ipcMain.handle('compress-video-batch', async (event, payload) => {
         automationAttempt.catch(() => {});
       }
       const failureStage = result.failureStage || task.lastProgress?.status;
-      const retryableFailure = failureStage === 'opening' || failureStage === 'uploading' || failureStage === 'rendering' || failureStage === 'downloading';
+      const retryableFailure = ['opening', 'uploading', 'configuring', 'submitting', 'rendering', 'downloading'].includes(failureStage);
       if (result.ok || result.removed || result.canceled || !retryableFailure || attempt >= maxRetries) break;
     }
     result = { taskId, ...result, superseded: Boolean(task.superseded || result?.superseded) };
