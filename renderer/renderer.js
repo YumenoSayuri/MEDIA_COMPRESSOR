@@ -335,7 +335,8 @@ const videoEls = {
   outputRow: $('videoOutputRow'), crf: $('videoCrf'), resolution: $('videoResolution'),
   framerate: $('videoFramerate'), videoCodec: $('videoCodec'), audioCodec: $('audioCodec'),
   picker: $('videoFilePicker'), dropzone: $('videoDropzone'), chooseOutput: $('chooseVideoOutput'),
-  autoRetry: $('videoAutoRetry'), retryCount: $('videoRetryCount'),
+  autoRetry: $('videoAutoRetry'), retryCount: $('videoRetryCount'), proxy: $('videoProxy'),
+  identityRotation: $('videoIdentityRotation'), identityRotations: $('videoIdentityRotations'),
 };
 const videoStatusText = {
   queued: '\u6392\u961f\u4e2d', retrying: '\u91cd\u8bd5\u4e2d', opening: '\u6253\u5f00 EchoWave', uploading: '\u4e0a\u4f20\u4e2d',
@@ -368,6 +369,9 @@ function currentVideoSettings() {
     videoCodec: videoEls.videoCodec.value, audioCodec: videoEls.audioCodec.value,
     saveMode: videoState.saveMode, outputFolder: videoState.outputFolder,
     autoRetry: Boolean(videoEls.autoRetry.checked), retryCount: Math.min(5, Math.max(0, Number(videoEls.retryCount.value) || 0)),
+    proxy: String(videoEls.proxy?.value || '').trim(),
+    identityRotation: Boolean(videoEls.identityRotation?.checked),
+    identityRotations: Math.min(200, Math.max(1, Number(videoEls.identityRotations?.value) || 20)),
   };
 }
 function scheduleSaveVideoSettings() {
@@ -392,6 +396,9 @@ async function loadVideoSettings() {
   if (settings.outputFolder) videoState.outputFolder = settings.outputFolder;
   videoEls.autoRetry.checked = Boolean(settings.autoRetry);
   if (Number.isFinite(Number(settings.retryCount))) videoEls.retryCount.value = Math.min(5, Math.max(0, Number(settings.retryCount)));
+  if (videoEls.proxy && typeof settings.proxy === 'string') videoEls.proxy.value = settings.proxy;
+  if (videoEls.identityRotation) videoEls.identityRotation.checked = settings.identityRotation !== false;
+  if (videoEls.identityRotations && Number.isFinite(Number(settings.identityRotations))) videoEls.identityRotations.value = Math.min(200, Math.max(1, Number(settings.identityRotations)));
   document.querySelectorAll('.video-tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.videoMode === videoState.mode));
   document.querySelectorAll('.video-presets button').forEach((button) => button.classList.toggle('active', button.dataset.videoPreset === videoState.preset));
   $('videoBasicOptions').hidden = videoState.mode !== 'basic';
@@ -700,6 +707,9 @@ $('startVideoCompress').addEventListener('click', async () => {
         resolution: videoEls.resolution.value, framerate: videoEls.framerate.value,
         videoCodec: videoEls.videoCodec.value, audioCodec: videoEls.audioCodec.value,
         outputFolder: videoState.outputFolder, saveMode: videoState.saveMode, concurrency: 2, autoRetry: videoEls.autoRetry.checked, retryCount: Math.min(5, Math.max(0, Number(videoEls.retryCount.value) || 0)),
+        proxy: String(videoEls.proxy?.value || '').trim(),
+        identityRotation: Boolean(videoEls.identityRotation?.checked),
+        identityRotations: Math.min(200, Math.max(1, Number(videoEls.identityRotations?.value) || 20)),
       },
     });
     results.forEach((result) => {
@@ -733,7 +743,7 @@ $('startVideoCompress').addEventListener('click', async () => {
 });
 for (const radio of document.querySelectorAll('input[name="videoSaveMode"]')) radio.addEventListener('change', () => { videoState.saveMode = radio.value; updateVideoSaveUI(); scheduleSaveVideoSettings(); });
 videoEls.autoRetry.addEventListener('change', updateVideoRetryUI);
-for (const control of [videoEls.crf, videoEls.resolution, videoEls.framerate, videoEls.videoCodec, videoEls.audioCodec, videoEls.autoRetry, videoEls.retryCount]) {
+for (const control of [videoEls.crf, videoEls.resolution, videoEls.framerate, videoEls.videoCodec, videoEls.audioCodec, videoEls.autoRetry, videoEls.retryCount, videoEls.proxy, videoEls.identityRotation, videoEls.identityRotations].filter(Boolean)) {
   control.addEventListener('change', scheduleSaveVideoSettings);
   control.addEventListener('input', scheduleSaveVideoSettings);
 }
